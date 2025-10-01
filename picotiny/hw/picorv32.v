@@ -76,6 +76,7 @@ module picorv32 #(
 	parameter [ 0:0] ENABLE_MUL = 0,
 	parameter [ 0:0] ENABLE_FAST_MUL = 0,
 	parameter [ 0:0] ENABLE_DIV = 0,
+	parameter [ 0:0] ENABLE_MOD = 1,
 	parameter [ 0:0] ENABLE_IRQ = 0,
 	parameter [ 0:0] ENABLE_IRQ_QREGS = 1,
 	parameter [ 0:0] ENABLE_IRQ_TIMER = 1,
@@ -166,7 +167,7 @@ module picorv32 #(
 	localparam integer regfile_size = (ENABLE_REGS_16_31 ? 32 : 16) + 4*ENABLE_IRQ*ENABLE_IRQ_QREGS;
 	localparam integer regindex_bits = (ENABLE_REGS_16_31 ? 5 : 4) + ENABLE_IRQ*ENABLE_IRQ_QREGS;
 
-	localparam WITH_PCPI = ENABLE_PCPI || ENABLE_MUL || ENABLE_FAST_MUL || ENABLE_DIV;
+	localparam WITH_PCPI = ENABLE_PCPI || ENABLE_MUL || ENABLE_FAST_MUL || ENABLE_DIV || ENABLE_MOD;
 
 	localparam [35:0] TRACE_BRANCH = {4'b 0001, 32'b 0};
 	localparam [35:0] TRACE_ADDR   = {4'b 0010, 32'b 0};
@@ -264,6 +265,11 @@ module picorv32 #(
 	wire        pcpi_div_wait;
 	wire        pcpi_div_ready;
 
+	wire        pcpi_mod_wr;
+	wire [31:0] pcpi_mod_rd;
+	wire        pcpi_mod_wait;
+	wire        pcpi_mod_ready;
+
 	reg        pcpi_int_wr;
 	reg [31:0] pcpi_int_rd;
 	reg        pcpi_int_wait;
@@ -322,11 +328,31 @@ module picorv32 #(
 		assign pcpi_div_ready = 0;
 	end endgenerate
 
+	generate if (ENABLE_MOD) begin
+		picorv32_pcpi_mod pcpi_mod (
+			.clk       (clk            ),
+			.resetn    (resetn         ),
+			.pcpi_valid(pcpi_valid     ),
+			.pcpi_insn (pcpi_insn      ),
+			.pcpi_rs1  (pcpi_rs1       ),
+			.pcpi_rs2  (pcpi_rs2       ),
+			.pcpi_wr   (pcpi_mod_wr    ),
+			.pcpi_rd   (pcpi_mod_rd    ),
+			.pcpi_wait (pcpi_mod_wait  ),
+			.pcpi_ready(pcpi_mod_ready )
+		);
+	end else begin
+		assign pcpi_mod_wr = 0;
+		assign pcpi_mod_rd = 32'bx;
+		assign pcpi_mod_wait = 0;
+		assign pcpi_mod_ready = 0;
+	end endgenerate
+
 	always @* begin
 		pcpi_int_wr = 0;
 		pcpi_int_rd = 32'bx;
-		pcpi_int_wait  = |{ENABLE_PCPI && pcpi_wait,  (ENABLE_MUL || ENABLE_FAST_MUL) && pcpi_mul_wait,  ENABLE_DIV && pcpi_div_wait};
-		pcpi_int_ready = |{ENABLE_PCPI && pcpi_ready, (ENABLE_MUL || ENABLE_FAST_MUL) && pcpi_mul_ready, ENABLE_DIV && pcpi_div_ready};
+		pcpi_int_wait  = |{ENABLE_PCPI && pcpi_wait,  (ENABLE_MUL || ENABLE_FAST_MUL) && pcpi_mul_wait,  ENABLE_DIV && pcpi_div_wait, ENABLE_MOD && pcpi_mod_wait};
+		pcpi_int_ready = |{ENABLE_PCPI && pcpi_ready, (ENABLE_MUL || ENABLE_FAST_MUL) && pcpi_mul_ready, ENABLE_DIV && pcpi_div_ready, ENABLE_MOD && pcpi_mod_ready};
 
 		(* parallel_case *)
 		case (1'b1)
@@ -341,6 +367,10 @@ module picorv32 #(
 			ENABLE_DIV && pcpi_div_ready: begin
 				pcpi_int_wr = pcpi_div_wr;
 				pcpi_int_rd = pcpi_div_rd;
+			end
+			ENABLE_MOD && pcpi_mod_ready: begin
+				pcpi_int_wr = pcpi_mod_wr;
+				pcpi_int_rd = pcpi_mod_rd;
 			end
 		endcase
 	end
@@ -2160,6 +2190,78 @@ module picorv32 #(
 `endif
 endmodule
 
+
+/***************************************************************
+ * picorv32_pcpi_mod
+ ***************************************************************/
+
+module picorv32_pcpi_mod (
+	input clk, resetn,
+
+	input             pcpi_valid,
+	input      [31:0] pcpi_insn,
+	input      [31:0] pcpi_rs1,
+	input      [31:0] pcpi_rs2,
+	output reg        pcpi_wr,
+	output reg [31:0] pcpi_rd,
+	output reg        pcpi_wait,
+	output reg        pcpi_ready
+);
+	// Simple custom-1 opcode decode: opcode=0001011 (CUSTOM-1), funct3=000 as MOD
+	reg instr_mod;
+
+	reg pcpi_wait_q;
+	wire start = pcpi_wait && !pcpi_wait_q;
+
+	always @(posedge clk) begin
+		instr_mod <= 0;
+		if (resetn && pcpi_valid && !pcpi_ready && pcpi_insn[6:0] == 7'b0001011) begin
+			if (pcpi_insn[14:12] == 3'b000)
+				instr_mod <= 1;
+		end
+		pcpi_wait <= instr_mod && resetn;
+		pcpi_wait_q <= pcpi_wait && resetn;
+	end
+
+	reg [31:0] dividend;
+	reg [62:0] divisor;
+	reg [31:0] quotient;
+	reg [31:0] quotient_msk;
+	reg running;
+	reg outsign;
+
+	always @(posedge clk) begin
+		pcpi_ready <= 0;
+		pcpi_wr <= 0;
+		pcpi_rd <= 'bx;
+
+		if (!resetn) begin
+			running <= 0;
+		end else
+		if (start) begin
+			running <= 1;
+			dividend <= pcpi_rs1[31] ? -pcpi_rs1 : pcpi_rs1;
+			divisor <= (pcpi_rs2[31] ? -pcpi_rs2 : pcpi_rs2) << 31;
+			outsign <= pcpi_rs1[31];
+			quotient <= 0;
+			quotient_msk <= 1 << 31;
+		end else
+		if (!quotient_msk && running) begin
+			running <= 0;
+			pcpi_ready <= 1;
+			pcpi_wr <= 1;
+			pcpi_rd <= outsign ? -dividend : dividend; // remainder result
+		end else begin
+			if (divisor <= dividend) begin
+				dividend <= dividend - divisor;
+				quotient <= quotient | quotient_msk;
+			end
+			divisor <= divisor >> 1;
+			quotient_msk <= quotient_msk >> 1;
+		end
+	end
+endmodule
+
 // This is a simple example implementation of PICORV32_REGS.
 // Use the PICORV32_REGS mechanism if you want to use custom
 // memory resources to implement the processor register file.
@@ -2524,6 +2626,7 @@ module picorv32_axi #(
 	parameter [ 0:0] ENABLE_MUL = 0,
 	parameter [ 0:0] ENABLE_FAST_MUL = 0,
 	parameter [ 0:0] ENABLE_DIV = 0,
+	parameter [ 0:0] ENABLE_MOD = 0,
 	parameter [ 0:0] ENABLE_IRQ = 0,
 	parameter [ 0:0] ENABLE_IRQ_QREGS = 1,
 	parameter [ 0:0] ENABLE_IRQ_TIMER = 1,
@@ -2655,6 +2758,7 @@ module picorv32_axi #(
 		.ENABLE_MUL          (ENABLE_MUL          ),
 		.ENABLE_FAST_MUL     (ENABLE_FAST_MUL     ),
 		.ENABLE_DIV          (ENABLE_DIV          ),
+		.ENABLE_MOD          (ENABLE_MOD          ),
 		.ENABLE_IRQ          (ENABLE_IRQ          ),
 		.ENABLE_IRQ_QREGS    (ENABLE_IRQ_QREGS    ),
 		.ENABLE_IRQ_TIMER    (ENABLE_IRQ_TIMER    ),
@@ -2822,6 +2926,7 @@ module picorv32_wb #(
 	parameter [ 0:0] ENABLE_MUL = 0,
 	parameter [ 0:0] ENABLE_FAST_MUL = 0,
 	parameter [ 0:0] ENABLE_DIV = 0,
+	parameter [ 0:0] ENABLE_MOD = 0,
 	parameter [ 0:0] ENABLE_IRQ = 0,
 	parameter [ 0:0] ENABLE_IRQ_QREGS = 1,
 	parameter [ 0:0] ENABLE_IRQ_TIMER = 1,
@@ -2919,6 +3024,7 @@ module picorv32_wb #(
 		.ENABLE_MUL          (ENABLE_MUL          ),
 		.ENABLE_FAST_MUL     (ENABLE_FAST_MUL     ),
 		.ENABLE_DIV          (ENABLE_DIV          ),
+		.ENABLE_MOD          (ENABLE_MOD          ),
 		.ENABLE_IRQ          (ENABLE_IRQ          ),
 		.ENABLE_IRQ_QREGS    (ENABLE_IRQ_QREGS    ),
 		.ENABLE_IRQ_TIMER    (ENABLE_IRQ_TIMER    ),
