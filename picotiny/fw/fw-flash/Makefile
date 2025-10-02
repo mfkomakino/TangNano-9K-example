@@ -8,9 +8,10 @@ SRCS = 	$(wildcard *.c)       		\
 		$(wildcard *.S)
 
 LDSCRIPT = ./linker_flash.ld
-
-RISCV_NAME ?= riscv-none-embed
-RISCV_PATH ?= D:/gnu-mcu-eclipse-riscv-none-gcc-8.2.0
+RISCV_NAME = riscv32-unknown-elf
+RISCV_PATH = /opt/riscv_custom
+# RISCV_NAME ?= riscv-none-embed
+# RISCV_PATH ?= D:/gnu-mcu-eclipse-riscv-none-gcc-8.2.0
 
 MABI=ilp32
 MARCH := rv32i

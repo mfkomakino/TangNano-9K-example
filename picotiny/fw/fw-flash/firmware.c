@@ -1,5 +1,7 @@
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
+
 
 // a pointer to this is a null pointer, but the compiler does not
 // know that because "sram" is a linker symbol from sections.lds.
@@ -91,7 +93,7 @@ void print_dec(uint32_t v)
     else putchar('0');
 }
 
-char getchar_prompt(char *prompt)
+int getchar_prompt(char *prompt)
 {
     int32_t c = -1;
 
@@ -124,7 +126,7 @@ char getchar_prompt(char *prompt)
     return c;
 }
 
-char getchar()
+int getchar()
 {
     return getchar_prompt(0);
 }
@@ -282,6 +284,33 @@ volatile int i;
 
 void main()
 {
+    // Test the custom mod instruction
+    int a = 7, b = 3, c;
+    int failed = 0;
+  
+    asm volatile
+    (
+      "mod   %[z], %[x], %[y]\n\t"
+      : [z] "=r" (c)
+      : [x] "r" (a), [y] "r" (b)
+    ); 
+   
+    // Test: 7 % 3 should equal 1
+    if ( c != 1 ){
+       print("\n[[FAILED]] Mod test: 7 % 3 = ");
+       print_dec(c);
+       print(" (expected 1)\n");       
+       failed = 1;
+    } else {
+        print("\n[[PASSED]] Mod test: 7 % 3 = 1\n");
+    }
+    
+    if (failed) {
+        print("[[OVERALL FAILED]]\n");
+    } else {
+        print("[[OVERALL PASSED]]\n");
+    }
+
     UART0->CLKDIV = CLK_FREQ / UART_BAUD - 2;
 
     GPIO0->OE = 0x3F;
